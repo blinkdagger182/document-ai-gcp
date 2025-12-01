@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PaddleOCR UI Builder Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        .container {
+            border: 2px dashed #ccc;
+            padding: 30px;
+            text-align: center;
+            border-radius: 10px;
+        }
+        input[type="file"] {
+            margin: 20px 0;
+        }
+        button {
+            background: #007AFF;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        #result {
+            margin-top: 20px;
+            text-align: left;
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 5px;
+            white-space: pre-wrap;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .loading {
+            color: #007AFF;
+            font-weight: bold;
+        }
+        .error {
+            color: red;
+        }
+        .success {
+            color: green;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎨 PaddleOCR UI Builder Test</h1>
+    <div class="container">
+        <h2>Upload an Image</h2>
+        <p>Upload a screenshot or image with text to generate UI components</p>
+        <input type="file" id="fileInput" accept="image/*">
+        <br>
+        <button id="uploadBtn" onclick="uploadImage()">Generate UI Components</button>
+        <div id="status"></div>
+        <div id="result"></div>
+    </div>
+
+    <script>
+        const API_URL = 'https://paddleocr-ui-builder-62nie56atq-uc.a.run.app';
+
+        async function uploadImage() {
+            const fileInput = document.getElementById('fileInput');
+            const statusDiv = document.getElementById('status');
+            const resultDiv = document.getElementById('result');
+            const uploadBtn = document.getElementById('uploadBtn');
+
+            if (!fileInput.files || !fileInput.files[0]) {
+                alert('Please select an image first');
+                return;
+            }
+
+            const file = fileInput.files[0];
+            
+            // Show loading state
+            uploadBtn.disabled = true;
+            statusDiv.innerHTML = '<p class="loading">⏳ Processing image...</p>';
+            resultDiv.innerHTML = '';
+
+            try {
+                // Create FormData
+                const formData = new FormData();
+                formData.append('file', file);
+
+                // Make request
+                const response = await fetch(`${API_URL}/ui/generate`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+
+                // Show success
+                statusDiv.innerHTML = '<p class="success">✅ Success!</p>';
+                resultDiv.innerHTML = JSON.stringify(data, null, 2);
+
+                // Log component summary
+                if (data.components) {
+                    console.log(`Found ${data.components.length} components:`);
+                    data.components.forEach(c => {
+                        console.log(`- ${c.type}: "${c.text}"`);
+                    });
+                }
+
+            } catch (error) {
+                statusDiv.innerHTML = `<p class="error">❌ Error: ${error.message}</p>`;
+                resultDiv.innerHTML = error.stack || error.toString();
+                console.error('Upload error:', error);
+            } finally {
+                uploadBtn.disabled = false;
+            }
+        }
+
+        // Test health endpoint on load
+        window.addEventListener('load', async () => {
+            try {
+                const response = await fetch(`${API_URL}/health`);
+                const data = await response.json();
+                console.log('Health check:', data);
+            } catch (error) {
+                console.error('Health check failed:', error);
+            }
+        });
+    </script>
+</body>
+</html>
