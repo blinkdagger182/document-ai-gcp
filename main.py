@@ -11,6 +11,7 @@ import fitz  # PyMuPDF
 from PIL import Image
 import io
 import base64
+import magic
 
 # Initialize PaddleOCR globally (once at startup, not per request)
 ocr = PaddleOCR(use_gpu=False, use_angle_cls=True, lang='en')
@@ -335,6 +336,62 @@ def process_ocr_on_image(image_path: str, page_num: int = 1, page_width: float =
     return fields
 
 
+def flatten_ui_schema_to_components(all_fields: List[Dict]) -> List[Dict]:
+    """
+    Convert OCR fields to flat components array for React Native
+    Returns: [{ id, type, label, value, bbox, page }, ...]
+    """
+    components = []
+    
+    for field in all_fields:
+        field_type = field["type"]
+        
+        # Skip non-fillable fields
+        if field_type in ["title", "label", "non_fillable"]:
+            continue
+        
+        component = {
+            "id": field["id"],
+            "label": field["label"],
+            "bbox": field["bbox"],
+            "page": field["page"]
+        }
+        
+        # Map field types to component types
+        if field_type == "checkbox":
+            component["type"] = "checkbox"
+            component["value"] = False
+        elif field_type == "text_field":
+            component["type"] = "input"
+            component["value"] = ""
+        elif field_type == "table_cell":
+            component["type"] = "input"
+            component["value"] = ""
+        else:
+            continue
+        
+        components.append(component)
+    
+    return components
+
+
+def create_field_map(all_fields: List[Dict]) -> Dict[str, Dict]:
+    """
+    Create fieldMap for overlay: { field_id: { bbox, page } }
+    """
+    field_map = {}
+    
+    for field in all_fields:
+        if field["type"] not in ["title", "label", "non_fillable"]:
+            field_map[field["id"]] = {
+                "bbox": field["bbox"],
+                "page": field["page"],
+                "type": field["type"]
+            }
+    
+    return field_map
+
+
 @app.post("/ocr")
 async def ocr_endpoint(file: UploadFile = File(...)):
     """
@@ -346,9 +403,26 @@ async def ocr_endpoint(file: UploadFile = File(...)):
     
     try:
         contents = await file.read()
-        file_ext = os.path.splitext(file.filename)[1].lower()
         
-        # Save uploaded file
+        # Detect actual file type from content (magic bytes)
+        mime = magic.from_buffer(contents, mime=True)
+        
+        # Determine correct extension based on actual content
+        if mime == 'application/pdf':
+            file_ext = '.pdf'
+        elif mime in ['image/jpeg', 'image/jpg']:
+            file_ext = '.jpg'
+        elif mime == 'image/png':
+            file_ext = '.png'
+        elif mime in ['image/bmp', 'image/x-ms-bmp']:
+            file_ext = '.bmp'
+        elif mime in ['image/tiff', 'image/x-tiff']:
+            file_ext = '.tiff'
+        else:
+            # Fallback to filename extension
+            file_ext = os.path.splitext(file.filename)[1].lower()
+        
+        # Save uploaded file with correct extension
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
             tmp.write(contents)
             tmp_path = tmp.name
@@ -426,6 +500,109 @@ async def ocr_endpoint(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
 
 
+@app.post("/ui/generate")
+async def ui_generate_endpoint(file: UploadFile = File(...)):
+    """
+    React Native compatible endpoint - mirror of /ocr
+    Returns flat components array for easy rendering
+    """
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+    
+    try:
+        contents = await file.read()
+        
+        # Detect actual file type from content (magic bytes)
+        mime = magic.from_buffer(contents, mime=True)
+        
+        # Determine correct extension based on actual content
+        if mime == 'application/pdf':
+            file_ext = '.pdf'
+        elif mime in ['image/jpeg', 'image/jpg']:
+            file_ext = '.jpg'
+        elif mime == 'image/png':
+            file_ext = '.png'
+        elif mime in ['image/bmp', 'image/x-ms-bmp']:
+            file_ext = '.bmp'
+        elif mime in ['image/tiff', 'image/x-tiff']:
+            file_ext = '.tiff'
+        else:
+            # Fallback to filename extension
+            file_ext = os.path.splitext(file.filename)[1].lower()
+        
+        # Save uploaded file with correct extension
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+            tmp.write(contents)
+            tmp_path = tmp.name
+        
+        all_fields = []
+        page_metadata = []
+        
+        try:
+            # Handle PDF
+            if file_ext == '.pdf':
+                images = pdf_to_images(tmp_path)
+                
+                for img_data in images:
+                    page_fields = process_ocr_on_image(
+                        img_data["path"], 
+                        img_data["page"],
+                        img_data["width"],
+                        img_data["height"]
+                    )
+                    all_fields.extend(page_fields)
+                    
+                    page_metadata.append({
+                        "page": img_data["page"],
+                        "width": img_data["width"],
+                        "height": img_data["height"]
+                    })
+                    
+                    # Cleanup temp image
+                    os.unlink(img_data["path"])
+            
+            # Handle images
+            elif file_ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
+                # Get image dimensions
+                img = Image.open(tmp_path)
+                width, height = img.size
+                
+                page_fields = process_ocr_on_image(tmp_path, 1, width, height)
+                all_fields.extend(page_fields)
+                
+                page_metadata.append({
+                    "page": 1,
+                    "width": width,
+                    "height": height
+                })
+            else:
+                raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF or image files.")
+            
+            # Convert to flat components array
+            components = flatten_ui_schema_to_components(all_fields)
+            
+            # Create field map for overlay
+            field_map = create_field_map(all_fields)
+            
+            return JSONResponse(content={
+                "success": True,
+                "components": components,
+                "fieldMap": field_map,
+                "metadata": {
+                    "pages": page_metadata,
+                    "total_pages": len(page_metadata),
+                    "total_fields": len(components)
+                }
+            })
+        
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
+
+
 @app.post("/overlay")
 async def overlay_pdf(
     file: UploadFile = File(...),
@@ -436,7 +613,7 @@ async def overlay_pdf(
     
     Input:
     - file: Original PDF
-    - filled_data: JSON string with field values and bboxes
+    - filled_data: JSON string with { documentId, values: { field_id: value } }
     
     Returns: Modified PDF with filled data
     """
@@ -464,16 +641,24 @@ async def overlay_pdf(
             # Open PDF with PyMuPDF
             doc = fitz.open(tmp_in_path)
             
+            # Get values and fieldMap
+            values = data.get("values", {})
+            field_map = data.get("fieldMap", {})
+            
             # Process each field
-            for field_data in data.get("fields", []):
-                page_num = field_data.get("page", 1) - 1  # 0-indexed
+            for field_id, value in values.items():
+                if not value or field_id not in field_map:
+                    continue
+                
+                field_info = field_map[field_id]
+                page_num = field_info.get("page", 1) - 1  # 0-indexed
+                
                 if page_num >= len(doc):
                     continue
                 
                 page = doc[page_num]
-                bbox = field_data.get("bbox", [])
-                value = field_data.get("value", "")
-                field_type = field_data.get("type", "text_field")
+                bbox = field_info.get("bbox", [])
+                field_type = field_info.get("type", "text_field")
                 
                 if len(bbox) != 8:
                     continue
@@ -485,7 +670,7 @@ async def overlay_pdf(
                 
                 # Handle different field types
                 if field_type == "checkbox":
-                    if value:
+                    if value is True or str(value).lower() in ['true', '1', 'yes']:
                         # Draw checkmark
                         draw_checkmark(page, rect)
                 else:

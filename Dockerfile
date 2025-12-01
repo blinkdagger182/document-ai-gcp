@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies for PaddleOCR and PyMuPDF
+# Install system dependencies for PaddleOCR, PyMuPDF, and python-magic
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     libglib2.0-0 \
@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender-dev \
     libfontconfig1 \
     libfreetype6 \
+    libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install dependencies
