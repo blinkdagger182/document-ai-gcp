@@ -1,25 +1,26 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from paddleocr import PaddleOCR
 import tempfile
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import re
 import json
 import fitz  # PyMuPDF
 from PIL import Image
 import io
 import base64
-import magic
+import uuid
+from datetime import datetime
 
 # Initialize PaddleOCR globally (once at startup, not per request)
 ocr = PaddleOCR(use_gpu=False, use_angle_cls=True, lang='en')
 
 app = FastAPI(
-    title="Document AI - PDF to UI to PDF",
-    description="Complete backend for PDF-to-UI-to-PDF with OCR, field detection, and overlay",
-    version="2.0.0"
+    title="Document AI - Hybrid Worker",
+    description="AcroForm detection with OCR fallback for PDF field extraction",
+    version="3.0.0"
 )
 
 # Enable CORS for React Native
@@ -35,7 +36,288 @@ app.add_middleware(
 @app.get("/health")
 async def health_check():
     """Health check endpoint for Cloud Run"""
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "3.0.0", "worker": "hybrid"}
+
+
+def detect_acroform_fields(doc: fitz.Document) -> Tuple[bool, List[Dict[str, Any]]]:
+    """
+    Detect AcroForm fields in PDF
+    Returns: (has_acroform, field_regions)
+    """
+    field_regions = []
+    
+    try:
+        # Check if PDF has AcroForm
+        if not doc.catalog or "AcroForm" not in doc.catalog:
+            return False, []
+        
+        acro_form = doc.catalog["AcroForm"]
+        if not acro_form or "Fields" not in acro_form:
+            return False, []
+        
+        fields = acro_form["Fields"]
+        if not fields or len(fields) == 0:
+            return False, []
+        
+        # Iterate through pages to find widget annotations
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            page_width = page.rect.width
+            page_height = page.rect.height
+            
+            # Get all widget annotations on this page
+            for annot in page.annots():
+                if not annot:
+                    continue
+                
+                # Check if it's a form field widget
+                if annot.type[0] != fitz.PDF_ANNOT_WIDGET:
+                    continue
+                
+                # Get field information
+                field_info = annot.info
+                rect = annot.rect
+                
+                # Extract field properties
+                field_type = annot.field_type  # 1=Text, 2=Button, 3=Choice, etc.
+                field_name = annot.field_name or f"field_{page_num}_{len(field_regions)}"
+                field_value = annot.field_value or ""
+                field_label = annot.field_label or field_name
+                
+                # Map field types
+                type_mapping = {
+                    fitz.PDF_WIDGET_TYPE_TEXT: "text_field",
+                    fitz.PDF_WIDGET_TYPE_BUTTON: "checkbox",
+                    fitz.PDF_WIDGET_TYPE_CHECKBOX: "checkbox",
+                    fitz.PDF_WIDGET_TYPE_RADIOBUTTON: "radio",
+                    fitz.PDF_WIDGET_TYPE_COMBOBOX: "dropdown",
+                    fitz.PDF_WIDGET_TYPE_LISTBOX: "listbox",
+                    fitz.PDF_WIDGET_TYPE_SIGNATURE: "signature",
+                }
+                
+                field_type_str = type_mapping.get(field_type, "text_field")
+                
+                # Normalize coordinates (0-1 range)
+                normalized_rect = {
+                    "x": rect.x0 / page_width,
+                    "y": rect.y0 / page_height,
+                    "width": (rect.x1 - rect.x0) / page_width,
+                    "height": (rect.y1 - rect.y0) / page_height
+                }
+                
+                # Absolute coordinates
+                absolute_rect = {
+                    "x0": rect.x0,
+                    "y0": rect.y0,
+                    "x1": rect.x1,
+                    "y1": rect.y1
+                }
+                
+                field_region = {
+                    "id": f"acro_{page_num}_{len(field_regions)}",
+                    "page": page_num + 1,
+                    "type": field_type_str,
+                    "name": field_name,
+                    "label": field_label,
+                    "value": field_value,
+                    "rect_normalized": normalized_rect,
+                    "rect_absolute": absolute_rect,
+                    "source": "acroform"
+                }
+                
+                field_regions.append(field_region)
+        
+        # Return True if we found any fields
+        return len(field_regions) > 0, field_regions
+    
+    except Exception as e:
+        print(f"Error detecting AcroForm: {str(e)}")
+        return False, []
+
+
+def infer_field_type_from_ocr(text: str, bbox: List[float], nearby_texts: List[str] = None) -> str:
+    """Infer field type from OCR text and context"""
+    text_lower = text.lower().strip()
+    
+    # Checkbox patterns
+    checkbox_patterns = [
+        r'^\s*[\[\]☐☑✓✗xX○●]\s*',
+        r'(yes|no|male|female|mr|ms|mrs|dr)$',
+    ]
+    for pattern in checkbox_patterns:
+        if re.search(pattern, text_lower):
+            return "checkbox"
+    
+    # Signature field
+    if any(keyword in text_lower for keyword in ['signature', 'sign here', 'signed']):
+        return "signature"
+    
+    # Date field
+    if any(keyword in text_lower for keyword in ['date', 'dd/mm', 'mm/dd', 'yyyy']):
+        return "date_field"
+    
+    # Text field (ends with colon or common field names)
+    if text.endswith(':') or any(keyword in text_lower for keyword in [
+        'name', 'address', 'email', 'phone', 'contact', 'nric', 'ic', 'passport'
+    ]):
+        return "text_field"
+    
+    # Default
+    return "text_field"
+
+
+def detect_fields_via_ocr(doc: fitz.Document) -> List[Dict[str, Any]]:
+    """
+    Fallback: Use OCR to detect field positions
+    """
+    field_regions = []
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        page_width = page.rect.width
+        page_height = page.rect.height
+        
+        # Render page to image at 2x resolution
+        mat = fitz.Matrix(2, 2)
+        pix = page.get_pixmap(matrix=mat)
+        
+        # Convert to PIL Image
+        img_data = pix.tobytes("png")
+        img = Image.open(io.BytesIO(img_data))
+        
+        # Save to temp file for OCR
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp:
+            img.save(tmp.name, 'PNG')
+            temp_path = tmp.name
+        
+        try:
+            # Run OCR
+            result = ocr.ocr(temp_path, cls=True)
+            
+            if result and result[0]:
+                for idx, line in enumerate(result[0]):
+                    box = line[0]  # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                    text_info = line[1]  # (text, confidence)
+                    
+                    text = text_info[0]
+                    confidence = float(text_info[1])
+                    
+                    # Scale coordinates back from 2x
+                    x0 = box[0][0] / 2
+                    y0 = box[0][1] / 2
+                    x1 = box[2][0] / 2
+                    y1 = box[2][1] / 2
+                    
+                    # Infer field type
+                    field_type = infer_field_type_from_ocr(text, box)
+                    
+                    # Normalize coordinates
+                    normalized_rect = {
+                        "x": x0 / page_width,
+                        "y": y0 / page_height,
+                        "width": (x1 - x0) / page_width,
+                        "height": (y1 - y0) / page_height
+                    }
+                    
+                    absolute_rect = {
+                        "x0": x0,
+                        "y0": y0,
+                        "x1": x1,
+                        "y1": y1
+                    }
+                    
+                    field_region = {
+                        "id": f"ocr_{page_num}_{idx}",
+                        "page": page_num + 1,
+                        "type": field_type,
+                        "name": f"field_{page_num}_{idx}",
+                        "label": text,
+                        "value": "",
+                        "confidence": confidence,
+                        "rect_normalized": normalized_rect,
+                        "rect_absolute": absolute_rect,
+                        "source": "ocr"
+                    }
+                    
+                    field_regions.append(field_region)
+        
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+    
+    return field_regions
+
+
+@app.post("/process")
+async def process_document(request: Request, file: UploadFile = File(...)):
+    """
+    Hybrid worker endpoint: Detect AcroForm fields first, fallback to OCR
+    Called by Cloud Tasks
+    """
+    document_id = str(uuid.uuid4())
+    start_time = datetime.utcnow()
+    
+    try:
+        # Validate file
+        if not file:
+            raise HTTPException(status_code=400, detail="No file uploaded")
+        
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported")
+        
+        # Read file
+        contents = await file.read()
+        
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+            tmp.write(contents)
+            tmp_path = tmp.name
+        
+        try:
+            # Open PDF with PyMuPDF
+            doc = fitz.open(tmp_path)
+            page_count = len(doc)
+            
+            # Step 1: Try to detect AcroForm fields
+            has_acroform, field_regions = detect_acroform_fields(doc)
+            
+            # Step 2: Fallback to OCR if no AcroForm
+            if not has_acroform:
+                print(f"No AcroForm detected for {document_id}, falling back to OCR")
+                field_regions = detect_fields_via_ocr(doc)
+            
+            doc.close()
+            
+            # Build response
+            response_data = {
+                "success": True,
+                "documentId": document_id,
+                "acroform": has_acroform,
+                "field_regions": field_regions,
+                "page_count": page_count,
+                "total_fields": len(field_regions),
+                "processing_time_ms": int((datetime.utcnow() - start_time).total_seconds() * 1000),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+            return JSONResponse(content=response_data)
+        
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+    
+    except Exception as e:
+        # Graceful error handling
+        error_response = {
+            "success": False,
+            "documentId": document_id,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "processing_time_ms": int((datetime.utcnow() - start_time).total_seconds() * 1000),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        return JSONResponse(content=error_response, status_code=500)
 
 
 def pdf_to_images(pdf_path: str) -> List[Dict[str, Any]]:
