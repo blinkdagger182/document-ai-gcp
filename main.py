@@ -645,15 +645,27 @@ async def overlay_pdf(
             values = data.get("values", {})
             field_map = data.get("fieldMap", {})
             
+            print(f"DEBUG: Processing {len(values)} values")
+            print(f"DEBUG: Field map has {len(field_map)} fields")
+            print(f"DEBUG: Values: {values}")
+            
             # Process each field
             for field_id, value in values.items():
-                if not value or field_id not in field_map:
+                # Skip only if value is None or empty string, but allow False for checkboxes
+                if (value is None or value == "") and value is not False:
                     continue
+                    
+                if field_id not in field_map:
+                    print(f"DEBUG: Field {field_id} not in field_map")
+                    continue
+                
+                print(f"DEBUG: Processing field {field_id} with value {value}")
                 
                 field_info = field_map[field_id]
                 page_num = field_info.get("page", 1) - 1  # 0-indexed
                 
                 if page_num >= len(doc):
+                    print(f"DEBUG: Page {page_num} out of range")
                     continue
                 
                 page = doc[page_num]
@@ -661,12 +673,16 @@ async def overlay_pdf(
                 field_type = field_info.get("type", "text_field")
                 
                 if len(bbox) != 8:
+                    print(f"DEBUG: Invalid bbox length: {len(bbox)}")
                     continue
                 
+                # OCR was done at 2x scale, so divide coordinates by 2
                 # Convert bbox [x1,y1,x2,y2,x3,y3,x4,y4] to rect
-                x1, y1 = min(bbox[0], bbox[6]), min(bbox[1], bbox[3])
-                x2, y2 = max(bbox[2], bbox[4]), max(bbox[5], bbox[7])
+                x1, y1 = min(bbox[0], bbox[6]) / 2, min(bbox[1], bbox[3]) / 2
+                x2, y2 = max(bbox[2], bbox[4]) / 2, max(bbox[5], bbox[7]) / 2
                 rect = fitz.Rect(x1, y1, x2, y2)
+                
+                print(f"DEBUG: Drawing at rect {rect} on page {page_num}")
                 
                 # Handle different field types
                 if field_type == "checkbox":
